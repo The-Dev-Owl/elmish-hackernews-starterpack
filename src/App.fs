@@ -3,6 +3,8 @@ module App
 open Elmish
 open Elmish.React
 open Feliz
+open Thoth.Json
+open Fable.SimpleHttp
 
 type HackernewsItem = {
   id: int
@@ -11,11 +13,28 @@ type HackernewsItem = {
   score : int
 }
 
-type State = {
-  StoryItems: HackernewsItem list
-}
+let itemDecoder : Decoder<HackernewsItem> = 
+  Decode.object (fun fields -> {
+    id = fields.Required.At [ "id" ] Decode.int
+    title = fields.Required.At [ "title" ] Decode.string
+    url = fields.Required.At [ "url" ] Decode.string
+    score = fields.Required.At [ "score" ] Decode.int
+  })
 
-type Msg = Msg of unit
+let parseItem (json: string) = 
+  Decode.fromString itemDecoder json
+
+
+type State = {
+  StoryItems: Deferred<Result<HackernewsItem list, string>>
+}
+(*
+Initialized       -> HasNotStartedYet
+Loading           -> InProgress
+Loaded with Error -> Resolved(Error "msg")
+Loaded with Data  -> Resolved(Ok list)
+*)
+type Msg = LoadStoryItems of AsyncOperationEvent<Result<HackernewsItem list, string>>
 
 let initialStoryItems = [
   {
@@ -32,21 +51,70 @@ let initialStoryItems = [
   }
 ]
 
+// Decoder<'t> 
+
 let init() =
-  let initialState = { StoryItems = initialStoryItems }
-  let initialCmd = Cmd.none
+  let initialState = { StoryItems = HasNotStartedYet }
+  let initialCmd = Cmd.ofMsg (LoadStoryItems Started)
   initialState, initialCmd
 
 let topStoriesEndpoint = "https://hacker-news.firebaseio.com/v0/topstories.json"
 let storyItemEndpoint (itemId: int) = sprintf "https://hacker-news.firebaseio.com/v0/item/%d.json" itemId
 
-let update (msg: Msg) (state: State) = state, Cmd.none
+let (|HttpOk|HttpError|) status =
+  match status with
+  | 200 -> HttpOk
+  | _ -> HttpError
+
+let loadStoryItem (itemId: int) = async {
+  let! (statusCode, responseText) = Http.get (storyItemEndpoint itemId)
+  match statusCode with 
+  | HttpOk -> 
+      match parseItem responseText with 
+      | Ok item -> return Some item
+      | _ -> return None
+  | HttpError -> 
+      return None
+}
+
+let loadStoryItems = async {
+  do! Async.Sleep 1000
+  let! (statusCode, responseText) = Http.get topStoriesEndpoint
+  match statusCode with 
+  | HttpOk ->
+      match Decode.fromString (Decode.list Decode.int) responseText with 
+      | Ok ids ->
+        let! storyItems =  
+          ids
+          |> List.truncate 50 
+          |> List.map loadStoryItem 
+          |> Async.Parallel
+          |> Async.map (Array.choose id >> List.ofArray)
+
+        return LoadStoryItems (Finished (Ok storyItems))
+      
+      | Error parseError -> 
+          return LoadStoryItems (Finished (Error parseError))
+  | HttpError -> 
+      return LoadStoryItems (Finished (Error responseText))
+}
+
+let update (msg: Msg) (state: State) =
+  match msg with 
+  | LoadStoryItems Started ->
+      { StoryItems = InProgress }, Cmd.fromAsync loadStoryItems
+  
+  | LoadStoryItems (Finished (Error error)) ->
+      { StoryItems = Resolved (Error error) }, Cmd.none
+
+  | LoadStoryItems (Finished (Ok items)) -> 
+      { StoryItems = Resolved (Ok items) }, Cmd.none
 
 let renderError (errorMsg: string) =
   Html.h1 [
     prop.style [ style.color.red ]
     prop.text errorMsg
-  ]
+  ] 
 
 let div (classes: string list) (children: ReactElement list) =
   Html.div [
@@ -79,7 +147,8 @@ let spinner =
     ]
   ]
 
-let renderItems = function
+let renderItems deferred = 
+  match deferred with
   | HasNotStartedYet -> Html.none
   | InProgress -> spinner
   | Resolved (Error errorMsg) -> renderError errorMsg
@@ -94,9 +163,7 @@ let render (state: State) (dispatch: Msg -> unit) =
         prop.text "Elmish Hackernews"
       ]
 
-      Html.fragment [
-        for item in state.StoryItems -> renderItem item
-      ]
+      renderItems state.StoryItems
     ]
   ]
 
