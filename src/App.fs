@@ -12,7 +12,10 @@ type HackernewsItem = {
   url: string
   score : int
 }
-type StoryItem = Deferred<Result<HackernewsItem, (int*string)>>
+
+// get rid of tuple in error
+type StoryItem = Deferred<Result<HackernewsItem, string>>
+
 type Stories = Deferred<Result<Map<int, StoryItem>, string>>
 
 let itemDecoder : Decoder<HackernewsItem> = 
@@ -30,19 +33,19 @@ type StoryLimit = StoryLimit of int
 
 type State = {
   StoryLimit: StoryLimit
+  // not really fond of Deferred in Deferred, there is 
+  // an opportunity for a better model!
   Stories:  Stories
 }
+
+// only two messages needed
 type Msg =
-  | LoadItem of int
   | LoadStoryIds of AsyncOperationEvent<Result<int list, string>>
   | LoadStoryItem of AsyncOperationEvent<Result<int * HackernewsItem, (int*string)>>
 
-// Decoder<'t> 
-
-let getStoryLimit limit = limit |> StoryLimit
-
 let init() =
-  let initialState = { StoryLimit = (getStoryLimit 10); Stories = HasNotStartedYet }
+                                      // getStoryLimit not needed
+  let initialState = { StoryLimit = StoryLimit 10; Stories = HasNotStartedYet }
   let initialCmd = Cmd.ofMsg (LoadStoryIds Started)
   initialState, initialCmd
 
@@ -55,89 +58,107 @@ let (|HttpOk|HttpError|) status =
   | _ -> HttpError
 
 let loadStoryItem (id: int) = async {
-
-  let r = System.Random()
-  do! Async.Sleep (r.Next(1000,5000))
   let! (statusCode, responseText) = Http.get (storyItemEndpoint id)
   match statusCode with 
   | HttpOk -> 
       match parseItem responseText with 
-      | Ok item -> return LoadStoryItem(Finished(Ok (id, item)))
-      | _ -> 
-        printfn "Story error: %i" id
-        return LoadStoryItem(Finished(Error (id, responseText)))
+      | Ok item -> 
+          return LoadStoryItem(Finished(Ok (id, item)))
 
-  | HttpError -> return LoadStoryItem(Finished (Error (id, (sprintf "error on endpoint %i" statusCode))))
+      | _ -> 
+          printfn "Story error: %i" id
+          return LoadStoryItem(Finished(Error (id, responseText)))
+
+  | HttpError -> 
+      return LoadStoryItem(Finished (Error (id, (sprintf "error on endpoint %i" statusCode))))
 }
 
-let loadStoryIds storyLimit = async {
-  do! Async.Sleep 1000
+let loadStoryIds (StoryLimit storyLimit) = async {
   let! (statusCode, responseText) = Http.get topStoriesEndpoint
   match statusCode with 
   | HttpOk ->
       match Decode.fromString (Decode.list Decode.int) responseText with 
-      | Ok ids -> return LoadStoryIds(Finished(Ok (ids |> List.truncate storyLimit)))
+      | Ok ids -> 
+          return LoadStoryIds(Finished(Ok (ids |> List.truncate storyLimit)))
+
       | Error parseError -> 
           return LoadStoryIds (Finished (Error parseError))
+          
   | HttpError -> 
       return LoadStoryIds (Finished (Error responseText))
 }
 
-let addStoryError (stories: Stories) id error =
-  match stories with
-  | HasNotStartedYet -> stories
-  | InProgress -> stories
-  | Resolved x ->
-    match x with
-    | Error _ -> stories
-    | Ok y -> Resolved(Ok (y.Remove(id).Add(id, Resolved(Error (id,error)))))
+// new declarative function withStory. 
+// Simplifies the update and no need for 
+// seperate addStoryError or addStory
+let withStory item state =
+  match state.Stories with 
+  | HasNotStartedYet | InProgress | Resolved (Error _) -> 
+      state
 
-let addStory (stories: Stories) id (newStory:HackernewsItem) =
-  // printfn "Added story: %A" newStory
-  match stories with
-  | HasNotStartedYet -> stories
-  | InProgress -> stories
-  | Resolved x ->
-    match x with
-    | Error y -> stories
-    | Ok y -> Resolved( Ok (y.Remove(id).Add(id, Resolved(Ok newStory))))
+  | Resolved (Ok stories) ->
+      let id,value =
+        match item with
+        | Ok (id, item) ->
+            id,Ok item
 
+        | Error (id, error) ->
+            id,Error error
+
+      // use Map.x functions to be more F# idiomatic
+      // Map.add replaces the value if available
+      // no need for removing
+      let stories =
+        stories
+        |> Map.add id (Resolved value)
+        |> Ok
+        |> Resolved            
+
+      { state with Stories = stories }      
 
 let update (msg: Msg) (state: State) =
   match msg with 
   | LoadStoryIds Started ->
-    let (StoryLimit storyLimit) = state.StoryLimit
-    state, Cmd.fromAsync (loadStoryIds storyLimit)
-  | LoadStoryIds (Finished(Error error)) -> {state with Stories = Resolved (Error error)}, Cmd.none
+      state, Cmd.fromAsync (loadStoryIds state.StoryLimit)
+
+  | LoadStoryIds (Finished(Error error)) -> 
+      {state with Stories = Resolved (Error error)}, Cmd.none
+
   | LoadStoryIds (Finished(Ok ids)) ->
-      let z = ids |> List.map (fun i -> i, HasNotStartedYet) |> Map.ofList
-      let y = ids |> List.map (LoadItem >> Cmd.ofMsg) |> Seq.ofList 
-      printfn "Batch command: %A" y 
-      { state with Stories = (Resolved(Ok z)) }, Cmd.batch y
+      let stories  = 
+        ids 
+        |> List.map (fun i -> i, HasNotStartedYet) 
+        |> Map.ofList
+        |> Ok 
+        |> Resolved
 
-  | LoadItem i -> state, Cmd.fromAsync (loadStoryItem i)
-  | LoadStoryItem (Finished(Ok (id, item))) ->
-    printfn "Finished command: %i" id
-    { state with Stories = (addStory state.Stories id item) }, Cmd.none
+      // direct use of Cmd.fromAsync makes LoadItem Msg obsolete
+      let cmds = 
+        ids 
+        |> List.map (loadStoryItem >> Cmd.fromAsync) 
+
+      { state with Stories = stories }, Cmd.batch cmds
+
+  // only one case for finished needed
+  // better keep update function small and use declarative style code
+  // you can later dig in to see what is actually happening
+  | LoadStoryItem (Finished story) ->
+      state |> withStory story, Cmd.none
         
-  | LoadStoryItem (Finished (Error (id, error))) ->
-    { state with Stories =(addStoryError state.Stories id error) }, Cmd.none
-
   | LoadStoryItem Started -> state, Cmd.none
 
-
 let renderItemError (id:int) (error:string) =
-    Html.div [
-      prop.key id
-      prop.className "box"
-      prop.style [ style.marginTop 15; style.marginBottom 15 ]
-      prop.children [
-        Html.h1 [
-          prop.style [ style.color.red ]
-          prop.text (sprintf "%s - Story Id: %i" error id)
-        ]     
-      ]
+  Html.div [
+    prop.key id
+    prop.className "box"
+    prop.style [ style.marginTop 15; style.marginBottom 15 ]
+    prop.children [
+      Html.h1 [
+        prop.style [ style.color.red ]
+        prop.text (sprintf "%s - Story Id: %i" error id)
+      ]     
     ]
+  ]
 
 let div (classes: string list) (children: ReactElement list) =
   Html.div [
@@ -178,7 +199,8 @@ let renderItem id (item:StoryItem) =
   match item with
   | HasNotStartedYet -> renderItemDom id None
   | InProgress -> renderItemDom id None
-  | Resolved (Error (id, errorMsg)) -> renderItemError id errorMsg
+               // id is already in function, no need to have it in tuple
+  | Resolved (Error error) -> renderItemError id error
   | Resolved (Ok item) -> renderItemDom id (Some item)
 
 
@@ -186,12 +208,11 @@ let renderStories (deferred: Stories) =
   match deferred with
   | HasNotStartedYet -> Html.none
   | InProgress -> spinner
-  | Resolved (Error errorMsg) -> Html.none
+  | Resolved (Error _) -> Html.none
   | Resolved (Ok items) -> 
       Html.fragment [ for KeyValue(k,v) in items -> renderItem k v ]
 
 let render (state: State) (dispatch: Msg -> unit) =
-  // printfn "render: %A" state
   Html.div [
     prop.style [ style.padding 20 ]
     prop.children [
