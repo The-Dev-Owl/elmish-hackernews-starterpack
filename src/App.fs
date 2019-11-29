@@ -12,6 +12,8 @@ type HackernewsItem = {
   url: string
   score : int
 }
+type StoryItem = Deferred<Result<HackernewsItem, (int*string)>>
+type Stories = Deferred<Result<Map<int, StoryItem>, string>>
 
 let itemDecoder : Decoder<HackernewsItem> = 
   Decode.object (fun fields -> {
@@ -24,38 +26,24 @@ let itemDecoder : Decoder<HackernewsItem> =
 let parseItem (json: string) = 
   Decode.fromString itemDecoder json
 
+type StoryLimit = StoryLimit of int
 
 type State = {
-  StoryItems: Deferred<Result<HackernewsItem list, string>>
+  StoryLimit: StoryLimit
+  Stories:  Stories
 }
-(*
-Initialized       -> HasNotStartedYet
-Loading           -> InProgress
-Loaded with Error -> Resolved(Error "msg")
-Loaded with Data  -> Resolved(Ok list)
-*)
-type Msg = LoadStoryItems of AsyncOperationEvent<Result<HackernewsItem list, string>>
-
-let initialStoryItems = [
-  {
-    id = 1;
-    title = "F#: An open-source, cross-platform functional programming language for .NET"
-    url = "https://dotnet.microsoft.com/languages/fsharp"
-    score = 9000
-  };
-  {
-    id = 2;
-    title = "PostgreSQL is a powerful, open source object-relational database system with over 30 years of active development"
-    url = "https://www.postgresql.org/"
-    score = 8650
-  }
-]
+type Msg =
+  | LoadItem of int
+  | LoadStoryIds of AsyncOperationEvent<Result<int list, string>>
+  | LoadStoryItem of AsyncOperationEvent<Result<int * HackernewsItem, (int*string)>>
 
 // Decoder<'t> 
 
+let getStoryLimit limit = limit |> StoryLimit
+
 let init() =
-  let initialState = { StoryItems = HasNotStartedYet }
-  let initialCmd = Cmd.ofMsg (LoadStoryItems Started)
+  let initialState = { StoryLimit = (getStoryLimit 10); Stories = HasNotStartedYet }
+  let initialCmd = Cmd.ofMsg (LoadStoryIds Started)
   initialState, initialCmd
 
 let topStoriesEndpoint = "https://hacker-news.firebaseio.com/v0/topstories.json"
@@ -66,55 +54,90 @@ let (|HttpOk|HttpError|) status =
   | 200 -> HttpOk
   | _ -> HttpError
 
-let loadStoryItem (itemId: int) = async {
-  let! (statusCode, responseText) = Http.get (storyItemEndpoint itemId)
+let loadStoryItem (id: int) = async {
+
+  let r = System.Random()
+  do! Async.Sleep (r.Next(1000,5000))
+  let! (statusCode, responseText) = Http.get (storyItemEndpoint id)
   match statusCode with 
   | HttpOk -> 
       match parseItem responseText with 
-      | Ok item -> return Some item
-      | _ -> return None
-  | HttpError -> 
-      return None
+      | Ok item -> return LoadStoryItem(Finished(Ok (id, item)))
+      | _ -> 
+        printfn "Story error: %i" id
+        return LoadStoryItem(Finished(Error (id, responseText)))
+
+  | HttpError -> return LoadStoryItem(Finished (Error (id, (sprintf "error on endpoint %i" statusCode))))
 }
 
-let loadStoryItems = async {
+let loadStoryIds storyLimit = async {
   do! Async.Sleep 1000
   let! (statusCode, responseText) = Http.get topStoriesEndpoint
   match statusCode with 
   | HttpOk ->
       match Decode.fromString (Decode.list Decode.int) responseText with 
-      | Ok ids ->
-        let! storyItems =  
-          ids
-          |> List.truncate 50 
-          |> List.map loadStoryItem 
-          |> Async.Parallel
-          |> Async.map (Array.choose id >> List.ofArray)
-
-        return LoadStoryItems (Finished (Ok storyItems))
-      
+      | Ok ids -> return LoadStoryIds(Finished(Ok (ids |> List.truncate storyLimit)))
       | Error parseError -> 
-          return LoadStoryItems (Finished (Error parseError))
+          return LoadStoryIds (Finished (Error parseError))
   | HttpError -> 
-      return LoadStoryItems (Finished (Error responseText))
+      return LoadStoryIds (Finished (Error responseText))
 }
+
+let addStoryError (stories: Stories) id error =
+  match stories with
+  | HasNotStartedYet -> stories
+  | InProgress -> stories
+  | Resolved x ->
+    match x with
+    | Error _ -> stories
+    | Ok y -> Resolved(Ok (y.Remove(id).Add(id, Resolved(Error (id,error)))))
+
+let addStory (stories: Stories) id (newStory:HackernewsItem) =
+  // printfn "Added story: %A" newStory
+  match stories with
+  | HasNotStartedYet -> stories
+  | InProgress -> stories
+  | Resolved x ->
+    match x with
+    | Error y -> stories
+    | Ok y -> Resolved( Ok (y.Remove(id).Add(id, Resolved(Ok newStory))))
+
 
 let update (msg: Msg) (state: State) =
   match msg with 
-  | LoadStoryItems Started ->
-      { StoryItems = InProgress }, Cmd.fromAsync loadStoryItems
-  
-  | LoadStoryItems (Finished (Error error)) ->
-      { StoryItems = Resolved (Error error) }, Cmd.none
+  | LoadStoryIds Started ->
+    let (StoryLimit storyLimit) = state.StoryLimit
+    state, Cmd.fromAsync (loadStoryIds storyLimit)
+  | LoadStoryIds (Finished(Error error)) -> {state with Stories = Resolved (Error error)}, Cmd.none
+  | LoadStoryIds (Finished(Ok ids)) ->
+      let z = ids |> List.map (fun i -> i, HasNotStartedYet) |> Map.ofList
+      let y = ids |> List.map (LoadItem >> Cmd.ofMsg) |> Seq.ofList 
+      printfn "Batch command: %A" y 
+      { state with Stories = (Resolved(Ok z)) }, Cmd.batch y
 
-  | LoadStoryItems (Finished (Ok items)) -> 
-      { StoryItems = Resolved (Ok items) }, Cmd.none
+  | LoadItem i -> state, Cmd.fromAsync (loadStoryItem i)
+  | LoadStoryItem (Finished(Ok (id, item))) ->
+    printfn "Finished command: %i" id
+    { state with Stories = (addStory state.Stories id item) }, Cmd.none
+        
+  | LoadStoryItem (Finished (Error (id, error))) ->
+    { state with Stories =(addStoryError state.Stories id error) }, Cmd.none
 
-let renderError (errorMsg: string) =
-  Html.h1 [
-    prop.style [ style.color.red ]
-    prop.text errorMsg
-  ] 
+  | LoadStoryItem Started -> state, Cmd.none
+
+
+let renderItemError (id:int) (error:string) =
+    Html.div [
+      prop.key id
+      prop.className "box"
+      prop.style [ style.marginTop 15; style.marginBottom 15 ]
+      prop.children [
+        Html.h1 [
+          prop.style [ style.color.red ]
+          prop.text (sprintf "%s - Story Id: %i" error id)
+        ]     
+      ]
+    ]
 
 let div (classes: string list) (children: ReactElement list) =
   Html.div [
@@ -122,24 +145,9 @@ let div (classes: string list) (children: ReactElement list) =
     prop.children children
   ]
 
-let renderItem item =
-  Html.div [
-    prop.key item.id
-    prop.className "box"
-    prop.style [ style.marginTop 15; style.marginBottom 15 ]
-    prop.children [
-      Html.a [
-        prop.style [ style.textDecoration.underline ]
-        prop.target.blank
-        prop.href item.url
-        prop.text item.title
-      ]
-    ]
-  ]
-
 let spinner =
   Html.div [
-    prop.style [ style.textAlign.center; style.marginTop 20 ]
+    prop.style [ style.textAlign.center ]
     prop.children [
       Html.i [
         prop.className "fa fa-cog fa-spin fa-2x"
@@ -147,14 +155,43 @@ let spinner =
     ]
   ]
 
-let renderItems deferred = 
+let cellLink item =
+  Html.a [
+    prop.style [ style.textDecoration.underline ]
+    prop.target.blank
+    prop.href item.url
+    prop.text item.title
+  ]
+
+let renderItemDom (id:int) (item: HackernewsItem option) =
+    Html.div [
+      prop.key id
+      prop.className "box"
+      prop.style [ style.marginTop 15; style.marginBottom 15 ]
+      prop.children [
+        match item with 
+        | Some x -> cellLink x  
+        | None -> spinner 
+      ]
+    ]
+let renderItem id (item:StoryItem) =
+  match item with
+  | HasNotStartedYet -> renderItemDom id None
+  | InProgress -> renderItemDom id None
+  | Resolved (Error (id, errorMsg)) -> renderItemError id errorMsg
+  | Resolved (Ok item) -> renderItemDom id (Some item)
+
+
+let renderStories (deferred: Stories) = 
   match deferred with
   | HasNotStartedYet -> Html.none
   | InProgress -> spinner
-  | Resolved (Error errorMsg) -> renderError errorMsg
-  | Resolved (Ok items) -> Html.fragment [ for item in items -> renderItem item ]
+  | Resolved (Error errorMsg) -> Html.none
+  | Resolved (Ok items) -> 
+      Html.fragment [ for KeyValue(k,v) in items -> renderItem k v ]
 
 let render (state: State) (dispatch: Msg -> unit) =
+  // printfn "render: %A" state
   Html.div [
     prop.style [ style.padding 20 ]
     prop.children [
@@ -163,7 +200,7 @@ let render (state: State) (dispatch: Msg -> unit) =
         prop.text "Elmish Hackernews"
       ]
 
-      renderItems state.StoryItems
+      renderStories state.Stories
     ]
   ]
 
